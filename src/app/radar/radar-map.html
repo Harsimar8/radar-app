@@ -193,11 +193,14 @@
             }
           }
           <label class="checkbox-field">
-            <input type="checkbox" [checked]="radarStyle().showFootprint"
-              (change)="onStyleChange({ showFootprint: $any($event.target).checked })">
-            <span><span class="swatch swatch--shadow"></span> Ground footprint — green seen, dark hidden</span>
+            <input type="checkbox"
+              [checked]="radarStyle().showLowerBeams ? radarStyle().showWedgeFootprint : radarStyle().showFootprint"
+              (change)="radarStyle().showLowerBeams
+                ? onStyleChange({ showWedgeFootprint: $any($event.target).checked })
+                : onStyleChange({ showFootprint: $any($event.target).checked })">
+            <span><span class="swatch swatch--shadow"></span> Ground footprint — green seen, red hidden</span>
           </label>
-          @if (radarStyle().showFootprint) {
+          @if (radarStyle().showLowerBeams ? radarStyle().showWedgeFootprint : radarStyle().showFootprint) {
             <div class="beam-control">
               <div class="beam-control__header">
                 <span>Footprint Opacity</span>
