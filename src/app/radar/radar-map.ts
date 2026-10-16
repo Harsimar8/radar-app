@@ -13,7 +13,6 @@ import { DecimalPipe } from '@angular/common';
 import * as Cesium from 'cesium';
 import { CESIUM_ION_TOKEN, START_VIEW } from '../config';
 import { BeamScanResult, BeamSettings, BlockedSector, CesiumRadarCoverage, RadarStyle } from './CesiumRadarCoverage';
-import { CesiumLosProbe, LosProbeResult } from './CesiumLosProbe';
 import { Radar } from './Radar';
 import { RadarRenderer } from './RadarRenderer';
 
@@ -55,16 +54,6 @@ export class RadarMap implements AfterViewInit, OnDestroy {
   protected readonly toolPanelOpen = signal(true);
   protected readonly radarPanelClosed = signal(false);
   private lastSelectedId: string | null = null;
-
-  // Click-to-explain line of sight ("why is this spot not covered?").
-  private losProbe!: CesiumLosProbe;
-  protected readonly losProbeEnabled = signal(false);
-  protected readonly losProbeResult = signal<LosProbeResult | null>(null);
-  // Re-run the probe under the mouse as it moves. Only one probe runs at a
-  // time; the newest mouse position waits and runs when it finishes.
-  protected readonly losProbeHover = signal(false);
-  private hoverProbeBusy = false;
-  private hoverProbePending: Cesium.Cartesian2 | null = null;
 
   // What each radar's beam reaches at its current angle (from the last build).
   private readonly scans = signal<Record<string, BeamScanResult>>({});
@@ -161,9 +150,6 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     // Finer terrain tiles when zoomed out (default 2), so the ground shown
     // stays closer to the detailed heights the coverage is built on.
     this.viewer.scene.globe.maximumScreenSpaceError = 1;
-    // Lets pickPosition find the point on the see-through beam, so the LOS
-    // probe can check a clicked point in the air.
-    this.viewer.scene.pickTranslucentDepth = true;
 
     this.renderer = new RadarRenderer(
       this.viewer,
@@ -178,8 +164,6 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     );
     this.renderer.render(this.radars());
 
-    this.losProbe = new CesiumLosProbe(this.viewer, terrainProvider);
-
     this.clickHandler = new Cesium.ScreenSpaceEventHandler(this.viewer.scene.canvas);
     this.clickHandler.setInputAction(
       (click: Cesium.ScreenSpaceEventHandler.PositionedEvent) => this.handleLeftClick(click),
@@ -188,7 +172,6 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     this.clickHandler.setInputAction(
       (move: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
         if (this.placing()) this.movePlacePreview(move.endPosition);
-        else this.hoverLosProbe(move.endPosition);
       },
       Cesium.ScreenSpaceEventType.MOUSE_MOVE
     );
@@ -232,10 +215,7 @@ export class RadarMap implements AfterViewInit, OnDestroy {
       const { [id]: _, ...rest } = all;
       return rest;
     });
-    if (this.selectedId() === id) {
-      this.selectedId.set(null);
-      this.clearLosProbe();
-    }
+    if (this.selectedId() === id) this.selectedId.set(null);
   }
 
   deleteAllRadars(): void {
@@ -245,7 +225,6 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     this.radars.set([]);
     this.scans.set({});
     this.selectedId.set(null);
-    this.clearLosProbe();
   }
 
   private addRadarAt(longitude: number, latitude: number): void {
@@ -386,6 +365,10 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     this.onBeamChange('beamElevationDeg', '' + this.roundAngle(this.beam().elevationDeg + deltaDeg));
   }
 
+  nudgeRange(deltaM: number): void {
+    this.onBeamChange('beamRange', '' + (this.beam().range + deltaM));
+  }
+
   /** Lowest angle (rounded up to 0.1 deg) at which the whole beam width is clear. */
   protected clearAngle(scan: BeamScanResult): number {
     return Math.ceil((scan.allClearDeg + 0.01) * 10) / 10;
@@ -497,24 +480,6 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     };
   });
 
-  // -------------------------------------------------------------------
-  // Line-of-sight probe
-  // -------------------------------------------------------------------
-
-  onLosProbeToggle(checked: boolean): void {
-    this.losProbeEnabled.set(checked);
-    if (!checked) this.clearLosProbe();
-  }
-
-  onLosProbeHoverToggle(checked: boolean): void {
-    this.losProbeHover.set(checked);
-  }
-
-  clearLosProbe(): void {
-    this.losProbe?.clear();
-    this.losProbeResult.set(null);
-  }
-
   // A see-through radar marker on the ground: where a radar being placed
   // will go.
   private addGhostMarker(position: Cesium.Cartesian3): Cesium.Entity {
@@ -572,80 +537,7 @@ export class RadarMap implements AfterViewInit, OnDestroy {
     const pickedEntity = picked?.id;
     if (pickedEntity?.isRadarMarker && pickedEntity.radarParentId) {
       this.selectRadar(pickedEntity.radarParentId);
-      return;
     }
-
-    // With the probe on, a click explains the line of sight to the point: in
-    // the air when the beam was clicked, on the ground otherwise.
-    if (this.losProbeEnabled()) {
-      const spot = this.probeSpotAt(click.position);
-      if (spot && this.runLosProbe(spot.target, spot.airHeight) !== null) return;
-    }
-  }
-
-  /**
-   * What a click / hover points at for the LOS probe: a point in the air on
-   * the beam when the beam is under the mouse (airHeight = its height), else
-   * the ground.
-   */
-  private probeSpotAt(position: Cesium.Cartesian2): { target: Cesium.Cartographic; airHeight?: number } | null {
-    const scene = this.viewer.scene;
-    const picked = scene.pick(position) as any;
-    if (picked?.primitive?.isBeamMesh) {
-      const onBeam = scene.pickPosition(position);
-      if (onBeam) {
-        const target = Cesium.Cartographic.fromCartesian(onBeam);
-        const ground = scene.globe.getHeight(target);
-        // A beam that touches the ground counts as a ground click.
-        if (ground === undefined || target.height - ground > RadarMap.AIR_MIN_HEIGHT_M) {
-          return { target, airHeight: target.height };
-        }
-      }
-    }
-    const ground = this.groundAt(position) ?? scene.pickPosition(position);
-    return ground ? { target: Cesium.Cartographic.fromCartesian(ground) } : null;
-  }
-
-  // A beam point closer than this to the ground is checked as the ground.
-  private static readonly AIR_MIN_HEIGHT_M = 10;
-
-  private hoverLosProbe(position: Cesium.Cartesian2): void {
-    if (!this.losProbeEnabled() || !this.losProbeHover() || this.placing()) {
-      return;
-    }
-    if (this.hoverProbeBusy) {
-      this.hoverProbePending = Cesium.Cartesian2.clone(position);
-      return;
-    }
-
-    const spot = this.probeSpotAt(position);
-    const run = spot ? this.runLosProbe(spot.target, spot.airHeight) : null;
-    if (!run) return;
-
-    this.hoverProbeBusy = true;
-    run.finally(() => {
-      this.hoverProbeBusy = false;
-      const next = this.hoverProbePending;
-      this.hoverProbePending = null;
-      if (next) this.hoverLosProbe(next);
-    });
-  }
-
-  /**
-   * Probes the radar that covers this point (in the air at airHeight, or on
-   * the ground); null (and clears) if none does.
-   */
-  private runLosProbe(target: Cesium.Cartographic, airHeight?: number): Promise<void> | null {
-    const radarId = this.losProbe.findRadarFor(target, this.selectedId());
-
-    if (!radarId) {
-      this.clearLosProbe();
-      return null;
-    }
-
-    return this.losProbe.probe(radarId, target, airHeight).then(result => {
-      if (result) this.losProbeResult.set(result);
-    });
   }
 
   /** Terrain under a screen position, ignoring the beams drawn on top. */

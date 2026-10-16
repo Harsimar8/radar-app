@@ -115,22 +115,6 @@ export interface ResolvedZone {
     azimuthWidthDeg: number;
 }
 
-export interface RadarZoneConfig {
-    name: string;
-    cssColor: string;
-    color: Cesium.Color;
-}
-
-// What a built radar needs to answer "can it see this point, and if not, why?".
-// Kept per radar entity for the click-to-explain probe (see CesiumLosProbe).
-export interface RadarGeometry {
-    radarPosition: Cesium.Cartesian3;
-    radarHeight: number;
-    enuMatrix: Cesium.Matrix4;
-    zones: ResolvedZone[];
-    targetHeightAgl: number;
-}
-
 interface TerrainProfile {
     azimuthDeg: number;
     horizontalDistances: number[];
@@ -250,7 +234,15 @@ const BEAM_MESH_MAX_ROWS = 360;
 const BEAM_SHEET_MAX_ROWS = 7200;
 const BEAM_RAY_POINTS = 100;
 // Lowest height (m) of the beam sheet above the sampled ground.
+// Kept a little above it, so the sheet never sits at the same depth as the
+// terrain and flickers into it (patchy green showing the map through).
 const BEAM_GROUND_CLEARANCE_M = 2;
+// Beam points higher than this above the sampled ground are left where they
+// are when the beam is placed on the terrain as drawn: the drawn tiles are
+// never that far off, so they cannot reach them.
+const BEAM_RESEAT_MARGIN_M = 60;
+// Samples placed on the drawn terrain per frame, so the map never stalls.
+const BEAM_RESEAT_PER_FRAME = 3000;
 // Faint range rings on the beam, as fractions of the range.
 const RANGE_RING_FRACTIONS = [0.25, 0.5, 0.75];
 const RANGE_RING_COLOR = Cesium.Color.WHITE.withAlpha(0.35);
@@ -304,22 +296,6 @@ const FOOTPRINT_SCORE_CLAMP_M = 25;
 // =============================================================================
 
 export class CesiumRadarCoverage {
-    // The radar's single beam, as a "zone" for the LOS probe.
-    public static readonly DEFAULT_3D_ZONES: RadarZoneConfig[] = [
-        { name: "Beam", cssColor: "#22c55e", color: CLEAR_COLOR }
-    ];
-
-    // Geometry of every built radar, keyed by entity id.
-    private static readonly geometries = new Map<string, RadarGeometry>();
-
-    static getGeometry(entityId: string): RadarGeometry | undefined {
-        return CesiumRadarCoverage.geometries.get(entityId);
-    }
-
-    static radarIds(): string[] {
-        return Array.from(CesiumRadarCoverage.geometries.keys());
-    }
-
     // Beam settings stored on a radar entity's properties. Older radars kept
     // the range per zone; that is used when no beam range is set.
     static beamOf(props: Record<string, any>): BeamSettings {
@@ -407,7 +383,7 @@ export class CesiumRadarCoverage {
             }
         });
         (marker as any).radarParentId = entityId;
-        // Clicking the radar itself always selects it, even with the LOS probe on.
+        // Clicking the radar itself always selects it.
         (marker as any).isRadarMarker = true;
         handles.push({ dispose: () => viewer.entities.remove(marker) });
 
@@ -424,19 +400,6 @@ export class CesiumRadarCoverage {
             azimuthStartDeg: wrap ? 0 : options.beam.azimuthDeg - widthDeg / 2,
             azimuthWidthDeg: widthDeg
         };
-        const targetHeightAgl = Math.max(0, options.beam.targetHeightAgl);
-
-        const geometry: RadarGeometry = { radarPosition, radarHeight, enuMatrix, zones: [zone], targetHeightAgl };
-        CesiumRadarCoverage.geometries.set(entityId, geometry);
-        handles.push({
-            dispose: () => {
-                // A newer build of the same radar may already have replaced it.
-                if (CesiumRadarCoverage.geometries.get(entityId) === geometry) {
-                    CesiumRadarCoverage.geometries.delete(entityId);
-                }
-            }
-        });
-
         // Terrain along every direction of the beam (cached: changing only the
         // angle reuses it, which is what keeps the angle slider and scan live).
         const azimuthStepDeg = options.azimuthStepDeg ?? Cesium.Math.clamp(
@@ -699,11 +662,18 @@ export class CesiumRadarCoverage {
             : Math.round((k * (rows - 1)) / Math.max(1, R - 1)));
         const C = BEAM_RAY_POINTS;
 
+        // Every point of the beam is kept as how it was made (where it is, the
+        // beam's height there, whether it lies on the ground) rather than as a
+        // fixed position, so it can be placed again on the terrain as Cesium
+        // draws it: zoomed out, the drawn tiles sit above or below the detailed
+        // heights the beam is worked out on, and the beam would sink into
+        // them or float over them where it meets the ground (see seat below).
         // The sheet is flat between its points along a direction (one every
-        // `step`), so a point clears the highest ground sampled within a step
-        // either side of it, not just the ground under it: then no bump
-        // between two points rises through the sheet. Ground behind where
-        // the beam meets a hill is left out (the sheet ends on that hill).
+        // `step`), so a point in the air clears the highest ground sampled
+        // within a step either side of it (sTop), not just the ground under
+        // it (sGround): then no bump between two points rises through the
+        // sheet. Ground behind where the beam meets a hill is left out (the
+        // sheet ends on that hill). A point on the ground stays on it.
         const step = grid.zone.range / (C - 1);
         const dists = grid.profiles[0].horizontalDistances;
         const spacing = dists.length > 1 ? dists[1] - dists[0] : TERRAIN_SAMPLE_SPACING_M;
@@ -718,28 +688,31 @@ export class CesiumRadarCoverage {
             }
             return top;
         };
-
-        // Never closer to that ground than BEAM_GROUND_CLEARANCE_M.
-        const rayPoint = (row: number, d: number) => {
+        const sLon: number[] = [], sLat: number[] = [], sAir: number[] = [], sGround: number[] = [], sTop: number[] = [];
+        const sample = (row: number, d: number, onGround: boolean) => {
             const g = CesiumRadarCoverage.groundAt(grid, row, d, lastCol);
-            const onGround = tips.hit[row] && d >= tips.dist[row];
-            const height = onGround ? g.height : CesiumRadarCoverage.beamHeightAt(angle, d, radarHeight);
-            return Cesium.Cartesian3.fromRadians(g.lon, g.lat,
-                Math.max(height, groundTopNear(row, d, g.height) + BEAM_GROUND_CLEARANCE_M));
+            sLon.push(g.lon);
+            sLat.push(g.lat);
+            sGround.push(g.height);
+            sTop.push(onGround ? g.height : groundTopNear(row, d, g.height));
+            sAir.push(onGround ? -Infinity : CesiumRadarCoverage.beamHeightAt(angle, d, radarHeight));
+            return sLon.length - 1;
         };
-
-        // A point on a direction at the beam's height, whether or not the
-        // beam still runs there (never below the ground clearance).
-        const airPoint = (row: number, d: number) => {
-            const g = CesiumRadarCoverage.groundAt(grid, row, d, lastCol);
-            return Cesium.Cartesian3.fromRadians(g.lon, g.lat,
-                Math.max(CesiumRadarCoverage.beamHeightAt(angle, d, radarHeight),
-                    groundTopNear(row, d, g.height) + BEAM_GROUND_CLEARANCE_M));
-        };
+        // Every polyline needs its own material: a PolylineCollection destroys
+        // each line's material when it is removed, so a shared one would be
+        // destroyed twice and throw, leaving the rest of the old beam behind.
+        const lineMaterial = (color: Cesium.Color) => Cesium.Material.fromType("Color", { color });
+        // A point: one sample, or halfway between two.
+        type BeamPoint = number | [number, number];
+        // A point on a direction as the beam runs there: in the air, or on
+        // the ground past where the terrain stops it.
+        const rayPoint = (row: number, d: number): BeamPoint =>
+            sample(row, d, !!tips.hit[row] && d >= tips.dist[row]);
         // Halfway between direction `own` (as the beam runs on it) and its
-        // neighbour, at distance d: the line where their slices meet.
-        const midPoint = (own: number, other: number, d: number) => Cesium.Cartesian3.midpoint(
-            rayPoint(own, d), airPoint(other, d), new Cesium.Cartesian3());
+        // neighbour at the beam's height (whether or not the beam still runs
+        // there), at distance d: the line where their slices meet.
+        const midPoint = (own: number, other: number, d: number): BeamPoint =>
+            [rayPoint(own, d) as number, sample(other, d, false)];
 
         // Every direction owns the slice of the sheet halfway to each
         // neighbour, out to its own end. A direction stopped early by a hill
@@ -747,42 +720,75 @@ export class CesiumRadarCoverage {
         // stepped edge, instead of a long slanted triangle joining its short
         // ray to its neighbour's long one.
         const pairs = wrap ? R : R - 1;
-        const positions = new Float64Array((R * C + pairs * 2 * C) * 3);
-        const put = (index: number, p: Cesium.Cartesian3) => positions.set([p.x, p.y, p.z], index * 3);
+        const meshPoints: BeamPoint[] = [];
+        const rowD = (row: number) => Array.from({ length: C }, (_, j) => (tips.dist[row] * j) / (C - 1));
         for (let k = 0; k < R; k++) {
             const row = rowIdx[k];
-            for (let j = 0; j < C; j++) put(k * C + j, rayPoint(row, (tips.dist[row] * j) / (C - 1)));
+            for (const d of rowD(row)) meshPoints.push(rayPoint(row, d));
         }
+        // Joins a direction's own points to the line it shares with its
+        // neighbour, both running out from the radar, stepping along
+        // whichever has the nearer next point.
+        const zip = (own: number[], ownD: number[], mid: number[], midD: number[], target: number[]) => {
+            let i = 0, m = 0;
+            while (i < own.length - 1 || m < mid.length - 1) {
+                if (m >= mid.length - 1 || (i < own.length - 1 && ownD[i + 1] <= midD[m + 1])) {
+                    target.push(own[i], own[i + 1], mid[m]);
+                    i++;
+                } else {
+                    target.push(own[i], mid[m + 1], mid[m]);
+                    m++;
+                }
+            }
+        };
         // Two surfaces: directions where the beam clears the terrain (green)
         // and directions stopped by it (red), switched on and off separately.
         const clearIndices: number[] = [];
         const blockedIndices: number[] = [];
         for (let k = 0; k < pairs; k++) {
             const k2 = (k + 1) % R;
-            const base = R * C + k * 2 * C;
-            // Half next to each of the two directions, with the line where
-            // they meet sampled at that direction's own distances.
-            for (const [own, other, mid] of [[k, k2, base], [k2, k, base + C]]) {
-                const row = rowIdx[own], otherRow = rowIdx[other];
-                for (let j = 0; j < C; j++) put(mid + j, midPoint(row, otherRow, (tips.dist[row] * j) / (C - 1)));
-                const target = tips.hit[row] ? blockedIndices : clearIndices;
-                for (let j = 0; j < C - 1; j++) {
-                    const r0 = own * C + j, r1 = r0 + 1, m0 = mid + j, m1 = m0 + 1;
-                    target.push(r0, r1, m0, r1, m1, m0);
-                }
+            const rowA = rowIdx[k], rowB = rowIdx[k2];
+            const dA = rowD(rowA), dB = rowD(rowB);
+            const short = Math.min(tips.dist[rowA], tips.dist[rowB]);
+            const longK = tips.dist[rowA] >= tips.dist[rowB] ? k : k2;
+            const longRow = rowIdx[longK], shortRow = longK === k ? rowB : rowA;
+            // The line where the two halves meet, one line for both (so no
+            // crack opens between them): out to the shorter direction's end at
+            // both directions' distances, then on beside the longer one alone.
+            const midD: number[] = [];
+            const midIdx: number[] = [];
+            const shared = [...dA, ...dB].filter(d => d <= short).sort((a, b) => a - b);
+            for (const d of shared) {
+                if (midD.length && d - midD[midD.length - 1] < 1e-6) continue;
+                midD.push(d);
+                midIdx.push(meshPoints.push([sample(rowA, d, false), sample(rowB, d, false)]) - 1);
+            }
+            const longD = rowD(longRow);
+            for (let j = 0; j < C; j++) {
+                if (longD[j] <= short + 1e-6) continue;
+                midD.push(longD[j]);
+                midIdx.push(meshPoints.push([longK * C + j, sample(shortRow, longD[j], false)]) - 1);
+            }
+            // Half next to each of the two directions, out to its own end.
+            for (const [own, ownD] of [[k, dA], [k2, dB]] as [number, number[]][]) {
+                const row = rowIdx[own];
+                const n = midD.findIndex(d => d > tips.dist[row] + 1e-6);
+                const end = n < 0 ? midD.length : n;
+                zip(Array.from({ length: C }, (_, j) => own * C + j), ownD,
+                    midIdx.slice(0, end), midD.slice(0, end), tips.hit[row] ? blockedIndices : clearIndices);
             }
         }
-        const boundingSphere = Cesium.BoundingSphere.fromVertices(Array.from(positions));
+
+        // Every line, with the points it runs through.
+        const linePoints = new Map<Cesium.Polyline, BeamPoint[]>();
+        const addLine = (lines: Cesium.PolylineCollection, pts: BeamPoint[], width: number, color: Cesium.Color) =>
+            linePoints.set(lines.add({ width, material: lineMaterial(color) }), pts);
 
         // Range rings and side edges.
         const tipLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
         // Edge where the beam runs the full range (in the air). Directions
         // stopped by terrain get no outline: the sheet's own edge shows them.
         const clearEdgeLines = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
-        // Every polyline needs its own material: a PolylineCollection destroys
-        // each line's material when it is removed, so a shared one would be
-        // destroyed twice and throw, leaving the rest of the old beam behind.
-        const lineMaterial = (color: Cesium.Color) => Cesium.Material.fromType("Color", { color });
         const tipOf = (row: number) => rayPoint(row, tips.dist[row]);
         let k = 0;
         while (k < R) {
@@ -803,16 +809,16 @@ export class CesiumRadarCoverage {
                     const after = next < R ? next : (wrap ? 0 : -1);
                     if (after >= 0) pts.push(midPoint(lastRow, rowIdx[after], tips.dist[lastRow]));
                 }
-                if (pts.length >= 2) clearEdgeLines.add({ positions: pts, width: 2.5, material: lineMaterial(CLEAR_COLOR) });
+                if (pts.length >= 2) addLine(clearEdgeLines, pts, 2.5, CLEAR_COLOR);
             }
             k = next;
         }
         // Range rings: drawn only over directions the beam reaches that far.
         for (const fraction of RANGE_RING_FRACTIONS) {
             const d = grid.zone.range * fraction;
-            let ring: Cesium.Cartesian3[] = [];
+            let ring: BeamPoint[] = [];
             const flush = () => {
-                if (ring.length >= 2) tipLines.add({ positions: ring, width: 1, material: lineMaterial(RANGE_RING_COLOR) });
+                if (ring.length >= 2) addLine(tipLines, ring, 1, RANGE_RING_COLOR);
                 ring = [];
             };
             for (let k = 0; k <= (wrap ? R : R - 1); k++) {
@@ -826,11 +832,8 @@ export class CesiumRadarCoverage {
         // Side edges (beam < 360°).
         if (!wrap) {
             for (const row of [rowIdx[0], rowIdx[R - 1]]) {
-                tipLines.add({
-                    positions: Array.from({ length: C }, (_, j) => rayPoint(row, (tips.dist[row] * j) / (C - 1))),
-                    width: 1.5,
-                    material: lineMaterial(CLEAR_COLOR)
-                });
+                addLine(tipLines, Array.from({ length: C }, (_, j) => rayPoint(row, (tips.dist[row] * j) / (C - 1))),
+                    1.5, CLEAR_COLOR);
             }
         }
 
@@ -841,11 +844,7 @@ export class CesiumRadarCoverage {
         const clearRays = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
         const blockedRays = viewer.scene.primitives.add(new Cesium.PolylineCollection()) as Cesium.PolylineCollection;
         for (let row = 0; row < rows; row++) {
-            (tips.hit[row] ? blockedRays : clearRays).add({
-                positions: [rayPoint(row, 0), tipOf(row)],
-                width: 1,
-                material: lineMaterial(RAY_LINE_COLOR)
-            });
+            addLine(tips.hit[row] ? blockedRays : clearRays, [rayPoint(row, 0), tipOf(row)], 1, RAY_LINE_COLOR);
         }
 
         // Stop points: where every blocked direction meets the terrain.
@@ -855,10 +854,11 @@ export class CesiumRadarCoverage {
         const stopPoints = viewer.scene.primitives.add(new Cesium.PointPrimitiveCollection()) as Cesium.PointPrimitiveCollection;
         const pointDepth = (far: boolean) => far ? Number.POSITIVE_INFINITY : 0;
         let pointsFar = CesiumRadarCoverage.isFarView(viewer);
+        const stopAt: BeamPoint[] = [];
         for (let row = 0; row < rows; row++) {
             if (!tips.hit[row]) continue;
+            stopAt.push(tipOf(row));
             stopPoints.add({
-                position: tipOf(row),
                 pixelSize: STOP_POINT_PX,
                 color: BLOCKED_COLOR,
                 outlineColor: Cesium.Color.BLACK.withAlpha(0.6),
@@ -872,10 +872,85 @@ export class CesiumRadarCoverage {
             for (let i = 0; i < stopPoints.length; i++) stopPoints.get(i).disableDepthTestDistance = pointDepth(pointsFar);
         });
 
+        // Height of each sample: on the ground, or at the beam's height but
+        // never closer to that ground than BEAM_GROUND_CLEARANCE_M (bumps
+        // would otherwise rise through the sheet and hide it short of its
+        // tip). Built on the detailed heights; seat (below) later moves the
+        // samples near the ground onto the terrain as drawn.
+        const heights = Float64Array.from(sAir, (air, i) => Math.max(air, sTop[i] + BEAM_GROUND_CLEARANCE_M));
+        const nearGround: number[] = [];
+        for (let i = 0; i < sAir.length; i++) if (sAir[i] - sTop[i] < BEAM_RESEAT_MARGIN_M) nearGround.push(i);
+        const scratch = new Cesium.Cartographic();
+        // Samples nearGround[from, to) on the drawn ground (ground not drawn
+        // yet counts as the detailed heights). The highest ground near a
+        // point is moved by as much as the drawn ground under it differs from
+        // the detailed one. Returns whether any moved.
+        const placeSamples = (from: number, to: number) => {
+            const globe = viewer.scene.globe;
+            let moved = false;
+            for (let n = from; n < to; n++) {
+                const i = nearGround[n];
+                scratch.longitude = sLon[i];
+                scratch.latitude = sLat[i];
+                const drawn = globe.getHeight(scratch) ?? sGround[i];
+                const h = Math.max(sAir[i], sTop[i] + drawn - sGround[i] + BEAM_GROUND_CLEARANCE_M);
+                if (Math.abs(h - heights[i]) >= 0.5) {
+                    heights[i] = h;
+                    moved = true;
+                }
+            }
+            return moved;
+        };
+        const positionOf = (p: BeamPoint): Cesium.Cartesian3 => typeof p === "number"
+            ? Cesium.Cartesian3.fromRadians(sLon[p], sLat[p], heights[p])
+            : Cesium.Cartesian3.midpoint(positionOf(p[0]), positionOf(p[1]), new Cesium.Cartesian3());
+        const positions = new Float64Array(meshPoints.length * 3);
+        const placeAll = () => {
+            for (let v = 0; v < meshPoints.length; v++) {
+                const p = positionOf(meshPoints[v]);
+                positions[v * 3] = p.x;
+                positions[v * 3 + 1] = p.y;
+                positions[v * 3 + 2] = p.z;
+            }
+            for (const [line, pts] of linePoints) line.positions = pts.map(positionOf);
+            for (let i = 0; i < stopAt.length; i++) stopPoints.get(i).position = positionOf(stopAt[i]);
+        };
+        placeAll();
+        const boundingSphere = Cesium.BoundingSphere.fromVertices(Array.from(positions));
+
         const clearMesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions,
             new Uint32Array(clearIndices), boundingSphere, () => [CLEAR_RGB, 1]);
         const blockedMesh = CesiumRadarCoverage.coloredMesh(viewer, entityId, positions,
             new Uint32Array(blockedIndices), boundingSphere, (_, red) => [red ? BLOCKED_RGB : CLEAR_RGB, 1]);
+
+        // Placed again whenever the view settles or new tiles finish loading,
+        // a few thousand samples a frame, then redrawn once if any moved.
+        // A new request starts over; the build itself never waits for it.
+        let seatFrame = 0;
+        const seat = () => {
+            cancelAnimationFrame(seatFrame);
+            let next = 0, moved = false;
+            const step = () => {
+                const to = Math.min(nearGround.length, next + BEAM_RESEAT_PER_FRAME);
+                if (placeSamples(next, to)) moved = true;
+                next = to;
+                if (next < nearGround.length) {
+                    seatFrame = requestAnimationFrame(step);
+                    return;
+                }
+                if (!moved) return;
+                placeAll();
+                clearMesh.refresh();
+                blockedMesh.refresh();
+                viewer.scene.requestRender();
+            };
+            seatFrame = requestAnimationFrame(step);
+        };
+        seat();
+        const removeMoveEndListener = viewer.camera.moveEnd.addEventListener(seat);
+        const removeTileListener = viewer.scene.globe.tileLoadProgressEvent.addEventListener((queued: number) => {
+            if (queued === 0) seat();
+        });
 
         return {
             dispose: () => {
@@ -884,6 +959,9 @@ export class CesiumRadarCoverage {
                 viewer.scene.primitives.remove(tipLines);
                 viewer.scene.primitives.remove(clearEdgeLines);
                 removePointsFarListener();
+                removeMoveEndListener();
+                removeTileListener();
+                cancelAnimationFrame(seatFrame);
                 viewer.scene.primitives.remove(clearRays);
                 viewer.scene.primitives.remove(blockedRays);
                 viewer.scene.primitives.remove(stopPoints);
@@ -921,7 +999,7 @@ export class CesiumRadarCoverage {
         indices: Uint32Array,
         boundingSphere: Cesium.BoundingSphere,
         colorOf: (v: number, red: boolean) => [number[], number]
-    ): { draw(opacity: number, red: boolean, light?: number): void; dispose(): void } {
+    ): { draw(opacity: number, red: boolean, light?: number): void; refresh(): void; dispose(): void } {
         const vertexCount = positions.length / 3;
         let primitive: Cesium.Primitive | null = null;
         let builtKey = "";
@@ -992,8 +1070,6 @@ export class CesiumRadarCoverage {
                     asynchronous: false
                 })) as Cesium.Primitive;
                 (primitive as any).radarParentId = entityId;
-                // A click on it is a click on a point in the air (LOS probe).
-                (primitive as any).isBeamMesh = true;
         };
         return {
             dispose: () => {
@@ -1001,7 +1077,12 @@ export class CesiumRadarCoverage {
                 removeFarListener();
                 remove();
             },
-            draw
+            draw,
+            // Redraw with the positions changed in place.
+            refresh: () => {
+                builtKey = "";
+                if (lastDraw) draw(...lastDraw);
+            }
         };
     }
 
@@ -1741,9 +1822,8 @@ export class CesiumRadarCoverage {
     }
 
     // -------------------------------------------------------------------
-    // 10. Shared line-of-sight maths (also used by CesiumLosProbe)
+    // 10. Shared line-of-sight maths
     // -------------------------------------------------------------------
-    static readonly NEAR_FIELD_IGNORE_M = NEAR_FIELD_IGNORE_M;
 
     // Slope (tan of the elevation angle) of the lowest line from the antenna
     // that passes no more than RIDGE_TOLERANCE_M below the terrain seen at
@@ -1764,11 +1844,5 @@ export class CesiumRadarCoverage {
     // elevation angle, after this horizontal distance (inverse of elevationAngle).
     static beamHeightAt(angle: number, dist: number, radarHeight: number): number {
         return radarHeight + dist * Math.tan(angle) + (dist * dist) / (2 * EFFECTIVE_EARTH_RADIUS_M);
-    }
-
-    // Ground point at this azimuth and horizontal distance from the radar.
-    static groundPointAt(geometry: RadarGeometry, azimuthDeg: number, dist: number): Cesium.Cartographic {
-        const ray = CesiumRadarCoverage.makeRay(geometry.radarPosition, geometry.enuMatrix, azimuthDeg, 0);
-        return Cesium.Cartographic.fromCartesian(Cesium.Ray.getPoint(ray, dist));
     }
 }

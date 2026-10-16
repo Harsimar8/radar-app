@@ -146,6 +146,11 @@
               {{ radarStyle().showLowerBeams ? 'Show red — air and ground hidden by terrain' : radarStyle().showStopPoints ? 'Show red — points where rays are stopped' : 'Show red — beam stopped by terrain' }}</span>
           </label>
           @if (!radarStyle().showLowerBeams) {
+            <label class="checkbox-field">
+              <input type="checkbox" [checked]="radarStyle().showRays"
+                (change)="onStyleChange({ showRays: $any($event.target).checked })">
+              <span>Show rays (every direction checked)</span>
+            </label>
             <div class="beam-control">
               <div class="beam-control__header">
                 <span>Beam Opacity</span>
@@ -325,21 +330,6 @@
           </div>
         }
 
-        <div class="beam-control">
-          <div class="beam-control__header">
-            <span>Range</span>
-            <div class="beam-value">
-              <input class="beam-number" type="number" min="500" max="100000" step="500"
-                [value]="beam().range"
-                (change)="onBeamChange('beamRange', $any($event.target).value)">
-              <em>m</em>
-            </div>
-          </div>
-          <input class="beam-slider" type="range" min="500" max="100000" step="500"
-            [value]="beam().range"
-            (change)="onBeamChange('beamRange', $any($event.target).value)">
-          <div class="beam-control__range"><span>0.5 km</span><span>100 km</span></div>
-        </div>
 
         <label class="field">
           <span>Mast Height (m)</span>
@@ -397,52 +387,31 @@
             mountains, so going far below 10 m mostly adds build time; under 5 m on a long range can take minutes.
           </div>
         </div>
-
-        @if (!radarStyle().showLowerBeams) {
-          <label class="checkbox-field">
-            <input type="checkbox" [checked]="radarStyle().showRays"
-              (change)="onStyleChange({ showRays: $any($event.target).checked })">
-            <span>Show rays (every direction checked)</span>
-          </label>
-        }
       </section>
 
       <section class="radar-section">
-        <h4 class="radar-section__title">Explain Blocking</h4>
+        <h4 class="radar-section__title">Range</h4>
 
-        <label class="checkbox-field">
-          <input type="checkbox"
-            [checked]="losProbeEnabled()"
-            (change)="onLosProbeToggle($any($event.target).checked)">
-          <span>Show Detection / Blocking Info</span>
-        </label>
-
-        @if (losProbeEnabled()) {
-          <label class="checkbox-field">
-            <input type="checkbox"
-              [checked]="losProbeHover()"
-              (change)="onLosProbeHoverToggle($any($event.target).checked)">
-            <span>Follow Mouse</span>
-          </label>
-          <div class="zone-card__hint">
-            {{ losProbeHover() ? 'Move the mouse' : 'Click any spot' }} to see line of sight and detection height
-            on that exact bearing. A clear result applies only to that direction through the beam.
-          </div>
-        }
-
-        @if (losProbeResult(); as result) {
-          <div class="los-result" [attr.data-status]="result.status">
-            <div class="los-result__header">
-              <strong>{{ result.title }}</strong>
-              <button class="icon-btn" title="Clear" (click)="clearLosProbe()">✕</button>
+        <div class="beam-control">
+          <div class="beam-control__header">
+            <span>Radar range</span>
+            <div class="beam-value">
+              <input class="beam-number" type="number" min="500" max="100000" step="500"
+                [value]="beam().range"
+                (change)="onBeamChange('beamRange', $any($event.target).value)">
+              <em>m</em>
             </div>
-            @for (line of result.explanation; track $index) {
-              <div class="los-result__line">{{ line }}</div>
-            }
           </div>
-        }
+          <div class="angle-row">
+            <button class="angle-btn" title="Decrease 1 km" (click)="nudgeRange(-1000)">−</button>
+            <input class="beam-slider" type="range" min="500" max="100000" step="500"
+              [value]="beam().range"
+              (change)="onBeamChange('beamRange', $any($event.target).value)">
+            <button class="angle-btn" title="Increase 1 km" (click)="nudgeRange(1000)">+</button>
+          </div>
+          <div class="beam-control__range"><span>0.5 km</span><span>100 km</span></div>
+        </div>
       </section>
-
 
     </div>
   </div>
