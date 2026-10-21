@@ -226,12 +226,19 @@ const EFFECTIVE_EARTH_RADIUS_M = EARTH_RADIUS_M * 4 / 3;
 const NEAR_FIELD_IGNORE_M = 10;
 // Terrain only blocks a point if it rises more than this above the straight
 // line from the antenna to that point (smaller rises are terrain-data noise).
+// Only an antenna low over the ground needs it (there every small bump in the
+// data tilts its horizon): it shrinks as the mast rises and is gone from
+// RIDGE_TOLERANCE_MAST_M up, where the terrain is taken exactly.
 const RIDGE_TOLERANCE_M = 2;
+const RIDGE_TOLERANCE_MAST_M = 10;
 // Beam sheet: at most this many directions, and points along each.
 const BEAM_MESH_MAX_ROWS = 360;
 // The beam sheet uses every direction (up to 0.05° apart all round), so its
 // edge and tip line pass through every stop point.
 const BEAM_SHEET_MAX_ROWS = 7200;
+// Points along each direction are spaced as (j / (C - 1))^2 of its length:
+// a few metres apart next to the antenna, where the directions fan out from
+// one point and the terrain under each differs, and widest at the far end.
 const BEAM_RAY_POINTS = 100;
 // Lowest height (m) of the beam sheet above the sampled ground.
 // Kept a little above it, so the sheet never sits at the same depth as the
@@ -241,6 +248,14 @@ const BEAM_GROUND_CLEARANCE_M = 2;
 // are when the beam is placed on the terrain as drawn: the drawn tiles are
 // never that far off, so they cannot reach them.
 const BEAM_RESEAT_MARGIN_M = 60;
+// The beam is lifted clear of the ground (above) only over this last stretch
+// before a direction meets the terrain, so it runs visibly up to its red stop
+// point; the lift eases in over the first BEAM_TIP_LIFT_RAMP_M of it, and from
+// nothing at the antenna to full BEAM_ANTENNA_LIFT_M out. Elsewhere the beam
+// is drawn at its true height.
+const BEAM_TIP_LIFT_M = 400;
+const BEAM_TIP_LIFT_RAMP_M = 150;
+const BEAM_ANTENNA_LIFT_M = 30;
 // Samples placed on the drawn terrain per frame, so the map never stalls.
 const BEAM_RESEAT_PER_FRAME = 3000;
 // Faint range rings on the beam, as fractions of the range.
@@ -418,12 +433,13 @@ export class CesiumRadarCoverage {
         );
 
         const rows = profiles.length;
+        const ridgeTolerance = RIDGE_TOLERANCE_M * Cesium.Math.clamp(1 - mastHeight / RIDGE_TOLERANCE_MAST_M, 0, 1);
         const rowStepDeg = wrap ? 360 / rows : widthDeg / Math.max(1, rows - 1);
         const grid: RayGrid = {
             zone,
             wrap,
             profiles,
-            rays: profiles.map(p => CesiumRadarCoverage.traceRay(p, radarHeight)),
+            rays: profiles.map(p => CesiumRadarCoverage.traceRay(p, radarHeight, ridgeTolerance)),
             rowAz: profiles.map((_, r) => zone.azimuthStartDeg + rowStepDeg * r),
             rowStepDeg,
             enuMatrix
@@ -478,9 +494,9 @@ export class CesiumRadarCoverage {
     // 2. Terrain seen along one direction: traceRay
     // -------------------------------------------------------------------
     // peakAngle is the steepest line from the antenna that still touches
-    // terrain so far (less the small-rise tolerance), so a ray at angle a runs
-    // the full range exactly when a > peakAngle at the last sample.
-    private static traceRay(profile: TerrainProfile, radarHeight: number): RayTrace {
+    // terrain so far (less the small-rise tolerance, in metres), so a ray at
+    // angle a runs the full range exactly when a > peakAngle at the last sample.
+    private static traceRay(profile: TerrainProfile, radarHeight: number, tolerance: number): RayTrace {
         const { horizontalDistances: dists, groundHeights } = profile;
         const n = dists.length;
         const groundAngle = new Float32Array(n).fill(-Math.PI / 2);
@@ -490,7 +506,7 @@ export class CesiumRadarCoverage {
             groundAngle[i] = CesiumRadarCoverage.elevationAngle(groundHeights[i], d, radarHeight);
             peakAngle[i] = d < NEAR_FIELD_IGNORE_M
                 ? peakAngle[i - 1]
-                : Math.max(peakAngle[i - 1], Math.atan(CesiumRadarCoverage.horizonTan(groundAngle[i], d)));
+                : Math.max(peakAngle[i - 1], Math.atan(CesiumRadarCoverage.horizonTan(groundAngle[i], d, tolerance)));
         }
         return { groundAngle, peakAngle };
     }
@@ -668,16 +684,22 @@ export class CesiumRadarCoverage {
         // draws it: zoomed out, the drawn tiles sit above or below the detailed
         // heights the beam is worked out on, and the beam would sink into
         // them or float over them where it meets the ground (see seat below).
-        // The sheet is flat between its points along a direction (one every
-        // `step`), so a point in the air clears the highest ground sampled
-        // within a step either side of it (sTop), not just the ground under
-        // it (sGround): then no bump between two points rises through the
-        // sheet. Ground behind where the beam meets a hill is left out (the
-        // sheet ends on that hill). A point on the ground stays on it.
-        const step = grid.zone.range / (C - 1);
+        // The sheet is flat between its points along a direction, so a point
+        // in the air clears the highest ground sampled within a step either
+        // side of it (sTop), not just the ground under it (sGround): then no
+        // bump between two points rises through the sheet. The step is the
+        // gap between points there (small near the antenna, see rowD), so
+        // the sheet is not lifted near the radar onto ground hundreds of
+        // metres away. Ground behind where the beam meets a hill is left out
+        // (the sheet ends on that hill). A point on the ground stays on it.
         const dists = grid.profiles[0].horizontalDistances;
         const spacing = dists.length > 1 ? dists[1] - dists[0] : TERRAIN_SAMPLE_SPACING_M;
+        // Gap between points at distance d on the longest direction (shorter
+        // ones have smaller gaps), and at least one terrain sample.
+        const stepAt = (d: number) =>
+            Math.max(spacing, (2 * Math.sqrt(Math.max(0, d) * grid.zone.range) + grid.zone.range / (C - 1)) / (C - 1));
         const groundTopNear = (row: number, d: number, fallback: number) => {
+            const step = stepAt(d);
             const heights = grid.profiles[row].groundHeights;
             const until = tips.hit[row] ? Math.min(d + step, tips.dist[row]) : d + step;
             const i0 = Math.max(1, Math.ceil((d - step) / spacing));
@@ -688,13 +710,30 @@ export class CesiumRadarCoverage {
             }
             return top;
         };
+        // sLift: how much of the lift a point gets, 0-1. It eases in over the
+        // last stretch before the stop point (a sudden lift would make a
+        // saw-tooth step on every slice) and is 0 everywhere else.
         const sLon: number[] = [], sLat: number[] = [], sAir: number[] = [], sGround: number[] = [], sTop: number[] = [];
+        const sLift: number[] = [];
         const sample = (row: number, d: number, onGround: boolean) => {
             const g = CesiumRadarCoverage.groundAt(grid, row, d, lastCol);
             sLon.push(g.lon);
             sLat.push(g.lat);
             sGround.push(g.height);
-            sTop.push(onGround ? g.height : groundTopNear(row, d, g.height));
+            let lift = onGround ? 1 : 0;
+            if (!onGround && tips.hit[row]) {
+                // A direction stopped within BEAM_TIP_LIFT_M is lifted all the
+                // way (else its start would hide in the ground, apart from its
+                // stop point); a longer one eases in over BEAM_TIP_LIFT_RAMP_M
+                // from BEAM_TIP_LIFT_M before its stop point.
+                const start = tips.dist[row] - BEAM_TIP_LIFT_M;
+                const t = start <= 0 ? 1 : Cesium.Math.clamp((d - start) / BEAM_TIP_LIFT_RAMP_M, 0, 1);
+                // Never at the antenna itself, so every direction starts there.
+                const a = Cesium.Math.clamp(d / BEAM_ANTENNA_LIFT_M, 0, 1);
+                lift = t * t * (3 - 2 * t) * a;
+            }
+            sLift.push(lift);
+            sTop.push(onGround ? g.height : lift > 0 ? groundTopNear(row, d, g.height) : -Infinity);
             sAir.push(onGround ? -Infinity : CesiumRadarCoverage.beamHeightAt(angle, d, radarHeight));
             return sLon.length - 1;
         };
@@ -721,7 +760,7 @@ export class CesiumRadarCoverage {
         // ray to its neighbour's long one.
         const pairs = wrap ? R : R - 1;
         const meshPoints: BeamPoint[] = [];
-        const rowD = (row: number) => Array.from({ length: C }, (_, j) => (tips.dist[row] * j) / (C - 1));
+        const rowD = (row: number) => Array.from({ length: C }, (_, j) => tips.dist[row] * (j / (C - 1)) ** 2);
         for (let k = 0; k < R; k++) {
             const row = rowIdx[k];
             for (const d of rowD(row)) meshPoints.push(rayPoint(row, d));
@@ -832,7 +871,7 @@ export class CesiumRadarCoverage {
         // Side edges (beam < 360°).
         if (!wrap) {
             for (const row of [rowIdx[0], rowIdx[R - 1]]) {
-                addLine(tipLines, Array.from({ length: C }, (_, j) => rayPoint(row, (tips.dist[row] * j) / (C - 1))),
+                addLine(tipLines, rowD(row).map(d => rayPoint(row, d)),
                     1.5, CLEAR_COLOR);
             }
         }
@@ -872,19 +911,25 @@ export class CesiumRadarCoverage {
             for (let i = 0; i < stopPoints.length; i++) stopPoints.get(i).disableDepthTestDistance = pointDepth(pointsFar);
         });
 
-        // Height of each sample: on the ground, or at the beam's height but
-        // never closer to that ground than BEAM_GROUND_CLEARANCE_M (bumps
-        // would otherwise rise through the sheet and hide it short of its
-        // tip). Built on the detailed heights; seat (below) later moves the
-        // samples near the ground onto the terrain as drawn.
-        const heights = Float64Array.from(sAir, (air, i) => Math.max(air, sTop[i] + BEAM_GROUND_CLEARANCE_M));
+        // Height of each sample, with the ground under it shifted by `shift`
+        // (how far the drawn terrain sits above the detailed heights): a stop
+        // point lies right on the ground; a point before it rises by its
+        // share of what it takes to clear the ground near it by
+        // BEAM_GROUND_CLEARANCE_M (bumps would otherwise rise through the
+        // sheet and hide it short of its tip); any other point is at the
+        // beam's true height. seat (below) later places the points near the
+        // ground on the terrain as drawn.
+        const heightOf = (i: number, shift: number) => {
+            if (sAir[i] === -Infinity) return sGround[i] + shift;
+            if (sLift[i] <= 0) return sAir[i];
+            return sAir[i] + sLift[i] * Math.max(0, sTop[i] + shift + BEAM_GROUND_CLEARANCE_M - sAir[i]);
+        };
+        const heights = Float64Array.from(sAir, (_, i) => heightOf(i, 0));
         const nearGround: number[] = [];
-        for (let i = 0; i < sAir.length; i++) if (sAir[i] - sTop[i] < BEAM_RESEAT_MARGIN_M) nearGround.push(i);
+        for (let i = 0; i < sAir.length; i++) if (sLift[i] > 0 && sAir[i] - sTop[i] < BEAM_RESEAT_MARGIN_M) nearGround.push(i);
         const scratch = new Cesium.Cartographic();
         // Samples nearGround[from, to) on the drawn ground (ground not drawn
-        // yet counts as the detailed heights). The highest ground near a
-        // point is moved by as much as the drawn ground under it differs from
-        // the detailed one. Returns whether any moved.
+        // yet counts as the detailed heights). Returns whether any moved.
         const placeSamples = (from: number, to: number) => {
             const globe = viewer.scene.globe;
             let moved = false;
@@ -893,7 +938,7 @@ export class CesiumRadarCoverage {
                 scratch.longitude = sLon[i];
                 scratch.latitude = sLat[i];
                 const drawn = globe.getHeight(scratch) ?? sGround[i];
-                const h = Math.max(sAir[i], sTop[i] + drawn - sGround[i] + BEAM_GROUND_CLEARANCE_M);
+                const h = heightOf(i, drawn - sGround[i]);
                 if (Math.abs(h - heights[i]) >= 0.5) {
                     heights[i] = h;
                     moved = true;
@@ -1826,11 +1871,11 @@ export class CesiumRadarCoverage {
     // -------------------------------------------------------------------
 
     // Slope (tan of the elevation angle) of the lowest line from the antenna
-    // that passes no more than RIDGE_TOLERANCE_M below the terrain seen at
+    // that passes no more than `tolerance` metres below the terrain seen at
     // `angle`, `dist` away. A point further out is hidden by that terrain
     // exactly when its own tan(angle) is below this value.
-    static horizonTan(angle: number, dist: number): number {
-        return Math.tan(angle) - RIDGE_TOLERANCE_M / dist;
+    static horizonTan(angle: number, dist: number, tolerance: number): number {
+        return Math.tan(angle) - tolerance / dist;
     }
 
     // Elevation angle from the antenna to ground at this height and distance,
